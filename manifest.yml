@@ -1,7 +1,7 @@
 ---
 declared-services:
   redis:
-    label: compose-for-redis
+    label: redis
     plan: standard
 applications:
 - name: hotelquery
