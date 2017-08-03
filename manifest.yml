@@ -1,6 +1,6 @@
 ---
 declared-services:
-  compose-for-redis-service:
+  redis:
     label: compose-for-redis
     plan: standard
 applications:
