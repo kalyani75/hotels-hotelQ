@@ -9,18 +9,28 @@ from flask_cors import cross_origin
 hotel = Blueprint('hotel', __name__)
 
 if 'VCAP_SERVICES' in os.environ: 
-	vcap_services = json.loads(os.environ['VCAP_SERVICES'])
+  vcap_services = json.loads(os.environ['VCAP_SERVICES'])
 
-	for key, value in vcap_services.iteritems():   # iter on both keys and values
-		if key.find('redis') > 0:
-		  redis_info = vcap_services[key][0]
+  uri = ''
+  urimq = ''
+
+  for key, value in vcap_services.iteritems():   # iter on both keys and values
+    if key.find('redis') > 0:
+      redis_info = vcap_services[key][0]
 		
-	cred = redis_info['credentials']
-	uri = cred['uri'].encode('utf8')
-  
-	redis = redis.StrictRedis.from_url(uri + '/0')
+      cred = redis_info['credentials']
+      uri = cred['uri'].encode('utf8')
+    elif key.find('mq') > 0:
+	    mq_info = vcap_services[key][0]
+		
+	    cred = mq_info['credentials']
+	    urimq = cred['uri'].encode('utf8')
+
+  rdb = redis.StrictRedis.from_url(uri + '/0')
+  mq  = redis.StrictRedis.from_url(urimq + '/0')  
 else:
-  redis = redis.StrictRedis(host=os.getenv('REDIS_HOST', 'localhost'), port=os.getenv('REDIS_PORT', 6379), db=0)
+  rdb = redis.StrictRedis(host=os.getenv('REDIS_HOST', 'localhost'), port=os.getenv('REDIS_PORT', 6379), db=0)
+  mq  = redis.StrictRedis(host=os.getenv('MQ_HOST', 'localhost'), port=os.getenv('MQ_PORT', 6379), db=0)  
      
 @hotel.errorhandler(400)
 def not_found(error):
@@ -34,12 +44,12 @@ def gethotelfragments(prefix, pagelength):
   prefix = prefix.lower()
   listpart = 50
 
-  start = redis.zrank('hotelfragments', prefix)
+  start = rdb.zrank('hotelfragments', prefix)
   if start < 0: return []
 
   hotelarray = []
   while (len(hotelarray) != pagelength):
-    range = redis.zrange('hotelfragments', start, start + listpart - 1)
+    range = rdb.zrange('hotelfragments', start, start + listpart - 1)
     start += listpart
 
     if not range or len(range) <= 0: 
@@ -61,7 +71,7 @@ def gethotelfragments(prefix, pagelength):
         hotelid = entry[indexwithperc + 1:-1]
         hotelname = entry[0:indexwithperc] 
         
-        hotelproperties = redis.lrange(hotelid, 0, -1)
+        hotelproperties = rdb.lrange(hotelid, 0, -1)
         if len(hotelproperties) > 0:
           hotel['id'] = hotelproperties[0]
           hotel['displayname'] = hotelproperties[1]
@@ -107,37 +117,54 @@ def createhotel():
   hotelname = hotel['acname']
   for l in range(1, len(hotelname)):
     hotelfragment = hotelname[0:l]
-    redis.zadd('hotelfragments', 0, hotelfragment)
+    rdb.zadd('hotelfragments', 0, hotelfragment)
   
   hotelwithid = hotelname + '%H-' + str(hotel['id']) + '%'
-  redis.zadd('hotelfragments', 0, hotelwithid)  
+  rdb.zadd('hotelfragments', 0, hotelwithid)  
   
   hotelkey = 'H-' + str(hotel['id'])
-  redis.execute_command('geoadd', 'hotels', '%f' % hotel['longitude'], '%f' % hotel['latitude'], hotelkey)
-  redis.delete(hotelkey)
+  rdb.execute_command('geoadd', 'hotels', '%f' % hotel['longitude'], '%f' % hotel['latitude'], hotelkey)
+  rdb.delete(hotelkey)
 
-  redis.rpush(hotelkey, hotel['id'])
-  redis.rpush(hotelkey, hotel['displayname'])
-  redis.rpush(hotelkey, hotel['acname'])
-  redis.rpush(hotelkey, hotel['image'])
-  redis.rpush(hotelkey, hotel['latitude'])
-  redis.rpush(hotelkey, hotel['longitude'])  
-  redis.rpush(hotelkey, hotel['thirdpartyrating']) 
+  rdb.rpush(hotelkey, hotel['id'])
+  rdb.rpush(hotelkey, hotel['displayname'])
+  rdb.rpush(hotelkey, hotel['acname'])
+  rdb.rpush(hotelkey, hotel['image'])
+  rdb.rpush(hotelkey, hotel['latitude'])
+  rdb.rpush(hotelkey, hotel['longitude'])  
+  rdb.rpush(hotelkey, hotel['thirdpartyrating']) 
   
   return jsonify({ 'hotel': hotel }), 201 
+
+def propagesearchinfo(sessionid, searchids):
+  mq.publish('searchqueue', json.dumps({ 'sessionid': sessionid, 'searchids': searchids }))
+
+  sub = mq.pubsub()
+  sub.subscribe('searchstatus')
+
+  while True:
+    for message in sub.listen():
+      if message['type'] == 'message':
+        print 'Found Search message in Queue ...'
+
+        data = message['data']
+        if (data == sessionid): 
+          return
 
 @hotel.route('/api/v1.0/hotels/search/<float:latitude>/<float:longitude>', methods=['GET'])
 @cross_origin()
 def hotelsearchbydistance(latitude, longitude):
   hotels = []
-  eachhotel = {}
+  searchids = []
 
   radius = int(request.args.get('radius'))
-  searchresults = redis.execute_command('georadius', 'hotels', '%f' % longitude, '%f' % latitude, '%d' % radius, 'km', 'WITHDIST', 'ASC')
+  sessionid = request.args.get('sessionid')
   
+  searchresults = rdb.execute_command('georadius', 'hotels', '%f' % longitude, '%f' % latitude, '%d' % radius, 'km', 'WITHDIST', 'ASC')
   for hotel in searchresults:
-    hotelproperties = redis.lrange(hotel[0], 0, -1)  
+    hotelproperties = rdb.lrange(hotel[0], 0, -1)  
 
+    eachhotel = {}
     eachhotel['id'] = hotelproperties[0]
     eachhotel['displayname'] = hotelproperties[1]
     eachhotel['acname'] = hotelproperties[2]
@@ -147,7 +174,8 @@ def hotelsearchbydistance(latitude, longitude):
     eachhotel['distance'] = round(float(hotel[1]), 3)
     eachhotel['thirdpartyrating'] = int(hotelproperties[6])
         
+    searchids.append(int(eachhotel['id']))
     hotels.append(eachhotel)
-    eachhotel = {}
 
-  return jsonify({ 'hotelsearch': hotels })    
+  propagesearchinfo(sessionid, searchids)
+  return jsonify({ 'hotelsearch': hotels })

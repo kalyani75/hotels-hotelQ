@@ -12,6 +12,6 @@ app.config['CORS_HEADERS'] = 'Content-Type'
 
 app.register_blueprint(hotel, url_prefix='/hotels.com')
 
-port = os.getenv('PORT', '9003')
+port = os.getenv('PORT', '9012')
 if __name__ == "__main__":
-  app.run(host='0.0.0.0', port=int(port))
+  app.run(host='0.0.0.0', port=int(port), debug=True)
