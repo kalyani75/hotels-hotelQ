@@ -1,8 +1,4 @@
 ---
-declared-services:
-  redis:
-    label: redis
-    plan: standard
 applications:
 - name: hotelquery
   memory: 256M
