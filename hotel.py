@@ -13,17 +13,13 @@ if 'VCAP_SERVICES' in os.environ:
 
   uri = ''
   urimq = ''
-
+  
   for key, value in vcap_services.iteritems():   # iter on both keys and values
     if key.find('redis') > 0:
       redis_info = vcap_services[key][0]
 		
       cred = redis_info['credentials']
       uri = cred['uri'].encode('utf8')
-    elif key.find('mq') > 0:
-	    mq_info = vcap_services[key][0]
-		
-	    cred = mq_info['credentials']
 	    urimq = cred['uri'].encode('utf8')
 
   rdb = redis.StrictRedis.from_url(uri + '/0')
