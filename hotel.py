@@ -12,6 +12,8 @@ if 'VCAP_SERVICES' in os.environ:
   vcap_services = json.loads(os.environ['VCAP_SERVICES'])
 
   uri = ''
+  urimq = ''
+  
   for key, value in vcap_services.iteritems():   # iter on both keys and values
     if key.find('redis') > 0:
       redis_info = vcap_services[key][0]
