@@ -20,7 +20,7 @@ if 'VCAP_SERVICES' in os.environ:
 		
       cred = redis_info['credentials']
       uri = cred['uri'].encode('utf8')
-	    urimq = cred['uri'].encode('utf8')
+      urimq = cred['uri'].encode('utf8')
 
   rdb = redis.StrictRedis.from_url(uri + '/0')
   mq  = redis.StrictRedis.from_url(urimq + '/0')  
