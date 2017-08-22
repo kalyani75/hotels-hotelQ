@@ -1,19 +1,25 @@
 import os
-
 import json
+import sys
+
 import redis
+import requests
 
 from flask import Blueprint, jsonify, request, url_for, make_response, abort
 from flask_cors import cross_origin
 
+from py_zipkin.zipkin import zipkin_span, ZipkinAttrs
 hotel = Blueprint('hotel', __name__)
+
+redispool = None
+mqpool = None
 
 if 'VCAP_SERVICES' in os.environ: 
   vcap_services = json.loads(os.environ['VCAP_SERVICES'])
 
   uri = ''
   urimq = ''
-  
+
   for key, value in vcap_services.iteritems():   # iter on both keys and values
     if key.find('redis') > 0:
       redis_info = vcap_services[key][0]
@@ -22,12 +28,17 @@ if 'VCAP_SERVICES' in os.environ:
       uri = cred['uri'].encode('utf8')
       urimq = cred['uri'].encode('utf8')
 
-  rdb = redis.StrictRedis.from_url(uri + '/0')
-  mq  = redis.StrictRedis.from_url(urimq + '/0')  
+  redispool = redis.ConnectionPool.from_url(uri + '/0')
+  mqpool  = redis.ConnectionPool.from_url(urimq + '/0')  
 else:
-  rdb = redis.StrictRedis(host=os.getenv('REDIS_HOST', 'localhost'), port=os.getenv('REDIS_PORT', 6379), db=0)
-  mq  = redis.StrictRedis(host=os.getenv('MQ_HOST', 'localhost'), port=os.getenv('MQ_PORT', 6379), db=0)  
-     
+  redispool = redis.ConnectionPool(host=os.getenv('REDIS_HOST', 'localhost'), port=os.getenv('REDIS_PORT', 6379), db=0)
+  mqpool = redis.ConnectionPool(host=os.getenv('MQ_HOST', 'localhost'), port=os.getenv('MQ_PORT', 6379), db=0)
+
+PORT = int(os.getenv('PORT', '9012'))
+ZIPKINHOST = os.getenv('ZIPKINHOST', 'zipkin')
+ZIPKINPORT = int(os.getenv('ZIPKINPORT', 9411))
+ZIPKINSAMPLERATE = float(os.getenv('ZIPKINSAMPLERATE', 100.0))
+
 @hotel.errorhandler(400)
 def not_found(error):
   return make_response(jsonify( { 'error': 'Bad request' }), 400)
@@ -36,7 +47,14 @@ def not_found(error):
 def not_found(error):
   return make_response(jsonify( { 'error': 'Not found' }), 404)
 
+def http_transport(encoded_span):
+  # The collector expects a thrift-encoded list of spans.
+  requests.post('http://' + ZIPKINHOST + ':' + str(ZIPKINPORT) + '/api/v1/spans', data=encoded_span, headers={'Content-Type': 'application/x-thrift'})  
+
+@zipkin_span(service_name='hotels.com:hotelquery', span_name='hotelquery:gethotelfragments')
 def gethotelfragments(prefix, pagelength):
+  rdb = redis.StrictRedis(connection_pool=redispool)
+
   prefix = prefix.lower()
   listpart = 50
 
@@ -84,94 +102,93 @@ def gethotelfragments(prefix, pagelength):
 @hotel.route('/api/v1.0/hotels/autocomplete/<prefix>', methods=['GET'])
 @cross_origin()
 def autocomplete(prefix):
-  if request.args.get('pagelength') is None: pagelength = 20
-  else: pagelength = int(request.args.get('pagelength'))
+  with zipkin_span(service_name='hotels.com:hotelquery', span_name='hotelquery:autocomplete', transport_handler=http_transport,
+    port=PORT, sample_rate=ZIPKINSAMPLERATE):  
+    if request.args.get('pagelength') is None: pagelength = 20
+    else: pagelength = int(request.args.get('pagelength'))
 
-  hotelarray = gethotelfragments(prefix, pagelength)
+    hotelarray = gethotelfragments(prefix, pagelength)
 
-  hotelcollection = {}
-  hotelcollection['hotels'] = hotelarray
+    hotelcollection = {}
+    hotelcollection['hotels'] = hotelarray
 
-  return json.dumps(hotelcollection)  
+    return json.dumps(hotelcollection)  
 
 @hotel.route('/api/v1.0/hotels', methods=['POST'])
 @cross_origin()
 def createhotel():
-  if not request.json or not 'displayname' in request.json or not 'id' in request.json:
-    abort(400)
+  with zipkin_span(service_name='hotels.com:hotelquery', span_name='hotelquery:createhotel', transport_handler=http_transport,
+    port=PORT, sample_rate=ZIPKINSAMPLERATE):  
+    rdb = redis.StrictRedis(connection_pool=redispool)
+    if not request.json or not 'displayname' in request.json or not 'id' in request.json:
+      abort(400)
  
-  hotel = {
-    'id': request.json['id'],
-    'displayname': request.json['displayname'],
-    'acname': request.json['acname'],    
-    'image': request.json.get('image', ''),
-    'latitude': request.json.get('latitude', 0),
-    'longitude': request.json.get('longitude', 0),
-    'thirdpartyrating': request.json.get('thirdpartyrating', 0)
-  }
+    hotel = {
+      'id': request.json['id'],
+      'displayname': request.json['displayname'],
+      'acname': request.json['acname'],    
+      'image': request.json.get('image', ''),
+      'latitude': request.json.get('latitude', 0),
+      'longitude': request.json.get('longitude', 0),
+      'thirdpartyrating': request.json.get('thirdpartyrating', 0)
+    }
 
-  hotelname = hotel['acname']
-  for l in range(1, len(hotelname)):
-    hotelfragment = hotelname[0:l]
-    rdb.zadd('hotelfragments', 0, hotelfragment)
+    hotelname = hotel['acname']
+    for l in range(1, len(hotelname)):
+      hotelfragment = hotelname[0:l]
+      rdb.zadd('hotelfragments', 0, hotelfragment)
   
-  hotelwithid = hotelname + '%H-' + str(hotel['id']) + '%'
-  rdb.zadd('hotelfragments', 0, hotelwithid)  
+    hotelwithid = hotelname + '%H-' + str(hotel['id']) + '%'
+    rdb.zadd('hotelfragments', 0, hotelwithid)  
   
-  hotelkey = 'H-' + str(hotel['id'])
-  rdb.execute_command('geoadd', 'hotels', '%f' % hotel['longitude'], '%f' % hotel['latitude'], hotelkey)
-  rdb.delete(hotelkey)
+    hotelkey = 'H-' + str(hotel['id'])
+    rdb.execute_command('geoadd', 'hotels', '%f' % hotel['longitude'], '%f' % hotel['latitude'], hotelkey)
+    rdb.delete(hotelkey)
 
-  rdb.rpush(hotelkey, hotel['id'])
-  rdb.rpush(hotelkey, hotel['displayname'])
-  rdb.rpush(hotelkey, hotel['acname'])
-  rdb.rpush(hotelkey, hotel['image'])
-  rdb.rpush(hotelkey, hotel['latitude'])
-  rdb.rpush(hotelkey, hotel['longitude'])  
-  rdb.rpush(hotelkey, hotel['thirdpartyrating']) 
+    rdb.rpush(hotelkey, hotel['id'])
+    rdb.rpush(hotelkey, hotel['displayname'])
+    rdb.rpush(hotelkey, hotel['acname'])
+    rdb.rpush(hotelkey, hotel['image'])
+    rdb.rpush(hotelkey, hotel['latitude'])
+    rdb.rpush(hotelkey, hotel['longitude'])  
+    rdb.rpush(hotelkey, hotel['thirdpartyrating']) 
   
-  return jsonify({ 'hotel': hotel }), 201 
-
-def propagesearchinfo(sessionid, searchids):
-  mq.publish('searchqueue', json.dumps({ 'sessionid': sessionid, 'searchids': searchids }))
-
-  sub = mq.pubsub()
-  sub.subscribe('searchstatus')
-
-  while True:
-    for message in sub.listen():
-      if message['type'] == 'message':
-        print 'Found Search message in Queue ...'
-
-        data = message['data']
-        if (data == sessionid): 
-          return
+    return jsonify({ 'hotel': hotel }), 201 
 
 @hotel.route('/api/v1.0/hotels/search/<float:latitude>/<float:longitude>', methods=['GET'])
 @cross_origin()
 def hotelsearchbydistance(latitude, longitude):
-  hotels = []
-  searchids = []
+  with zipkin_span(service_name='hotels.com:hotelquery', zipkin_attrs=ZipkinAttrs(trace_id=request.headers['X-B3-TraceID'],
+    span_id=request.headers['X-B3-SpanID'], parent_span_id=request.headers['X-B3-ParentSpanID'], flags='1', is_sampled=
+    request.headers['X-B3-Sampled']), span_name='hotelquery:hotelsearchbydistance', transport_handler=http_transport, port=PORT, 
+    sample_rate=ZIPKINSAMPLERATE):
+    sessionid = request.args.get('sessionid')
 
-  radius = int(request.args.get('radius'))
-  sessionid = request.args.get('sessionid')
-  
-  searchresults = rdb.execute_command('georadius', 'hotels', '%f' % longitude, '%f' % latitude, '%d' % radius, 'km', 'WITHDIST', 'ASC')
-  for hotel in searchresults:
-    hotelproperties = rdb.lrange(hotel[0], 0, -1)  
+    mq = redis.StrictRedis(connection_pool=mqpool)
+    mq.publish(sessionid, json.dumps({ 'sessionid': sessionid, 'event': 'hotelsearchinitiated' }))
 
-    eachhotel = {}
-    eachhotel['id'] = hotelproperties[0]
-    eachhotel['displayname'] = hotelproperties[1]
-    eachhotel['acname'] = hotelproperties[2]
-    eachhotel['image'] = hotelproperties[3]
-    eachhotel['latitude'] = hotelproperties[4]
-    eachhotel['longitude'] = hotelproperties[5]
-    eachhotel['distance'] = round(float(hotel[1]), 3)
-    eachhotel['thirdpartyrating'] = int(hotelproperties[6])
+    rdb = redis.StrictRedis(connection_pool=redispool)
+    radius = int(request.args.get('radius'))
+
+    hotels = []
+    searchids = []
+
+    searchresults = rdb.execute_command('georadius', 'hotels', '%f' % longitude, '%f' % latitude, '%d' % radius, 'km', 'WITHDIST', 'ASC')
+    for hotel in searchresults:
+      hotelproperties = rdb.lrange(hotel[0], 0, -1)  
+
+      eachhotel = {}
+      eachhotel['id'] = hotelproperties[0]
+      eachhotel['displayname'] = hotelproperties[1]
+      eachhotel['acname'] = hotelproperties[2]
+      eachhotel['image'] = hotelproperties[3]
+      eachhotel['latitude'] = hotelproperties[4]
+      eachhotel['longitude'] = hotelproperties[5]
+      eachhotel['distance'] = round(float(hotel[1]), 3)
+      eachhotel['thirdpartyrating'] = int(hotelproperties[6])
         
-    searchids.append(int(eachhotel['id']))
-    hotels.append(eachhotel)
+      searchids.append(int(eachhotel['id']))
+      hotels.append(eachhotel)
 
-  propagesearchinfo(sessionid, searchids)
-  return jsonify({ 'hotelsearch': hotels })
+    mq.publish(sessionid, json.dumps({ 'sessionid': sessionid, 'event': 'hotelsearchcompleted', 'searchids': searchids }))
+    return jsonify({ 'hotelsearch': hotels })  
